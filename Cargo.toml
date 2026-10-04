@@ -1,0 +1,12 @@
+[package]
+name = "gtr9-fan-control"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Fail-safe quiet fan control for the Beelink GTR9 Pro"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

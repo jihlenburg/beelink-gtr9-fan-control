@@ -1,0 +1,24 @@
+[Unit]
+Description=Quiet fail-safe fan control for Beelink GTR9 Pro
+After=systemd-modules-load.service
+ConditionPathExists=/sys/class/hwmon
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/gtr9-fan-control run /etc/gtr9-fan-control.conf
+ExecStopPost=/usr/local/sbin/gtr9-fan-control restore
+Restart=no
+TimeoutStopSec=15
+User=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
