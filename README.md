@@ -46,6 +46,22 @@ sudo systemctl enable --now gtr9-fan-control
 journalctl -u gtr9-fan-control -f
 ```
 
+### Update an existing installation
+
+Build the new version and validate the installed configuration before stopping the running service:
+
+```sh
+cargo test
+cargo build --release
+target/release/gtr9-fan-control validate /etc/gtr9-fan-control.conf
+sudo systemctl stop gtr9-fan-control
+sudo ./install.sh
+sudo systemctl start gtr9-fan-control
+gtr9-fan-control status
+```
+
+The installer preserves `/etc/gtr9-fan-control.conf`, so an existing 12% floor needs an explicit configuration edit to adopt 15%. Set the first curve point to `0:15` after checking the calibration on your machine. Every curve duty must be positive; use the fan-stop settings for intentional stopping. Resolve validation errors before continuing with installation and service startup.
+
 ## Operation and recovery
 
 `status` and `validate` are read-only and run without `sudo` when the sensor files and configuration are readable. `run` and `restore` write hardware settings and require root. If `/usr/local/sbin` is absent from your shell's `PATH`, use `/usr/local/sbin/gtr9-fan-control`.
@@ -128,6 +144,8 @@ On this machine, 8%, 10%, and 12% all produced approximately 690 RPM on fan3; 5%
 
 Fan-stop requires 30 seconds with every logical CPU at most 10% busy, GPU utilization at most 5%, and CPU/GPU, motherboard and SSD temperatures at or below 45C. Activity or any of these temperatures reaching 50C restarts the fans. Restart uses a one-second pulse at at least 35% duty. Omit `fan_stop_below_c` to disable fan-stop.
 
+The 15% floor applies while the fans are running. With fan-stop enabled, an idle machine can still report `pwm2=0`, `pwm3=0`, and zero fan3 RPM. Once stopped, the fans can remain off between 45C and 50C while the machine stays idle; this temperature gap prevents frequent stop/start cycles.
+
 Each curve point is `temperature_C:duty_percent`, with duty in `1..100`. Use the fan-stop settings for intentional zero duty. The curve selects the last point whose temperature is at or below the current reading; values are not interpolated. Duty increases on the next polling iteration and decreases only after the configured delay and hysteresis margin.
 
 Edit `/etc/gtr9-fan-control.conf`, validate it, and restart to apply changes:
@@ -151,6 +169,8 @@ Configuration is loaded at startup. Validation checks syntax and configuration c
 | Missing ITE attribute | Verify the hardware and driver expose the expected PWM channels and fan3 tachometer. |
 | Temperature or activity read failure | Inspect the logged error and sensor availability; auxiliary sensors and GPU activity are used by fan-stop mode. |
 | Fan3 remains stopped after recovery | Restore firmware control and check the fan and calibrated running duty before restarting. |
+| Fan3 reads zero RPM with both PWM values at zero | This is intentional fan-stop. Activity or the resume temperature should restart the fans. |
+| Journal updates only once per minute | Expected while duty is steady. Sensor polling and protection still run every `poll_seconds`. |
 
 ## Uninstall
 
@@ -181,6 +201,16 @@ Further display-off tests on 2026-10-04 used the updated daemon and 15% running 
 The power-saver result was close to the later baseline readings, so these tests did not establish a repeatable saving. USB autosuspend suspended one receiver, while the other receiver, POROSVOC device, and both affected USB controllers remained active. Both experiments restored the original power profile and USB settings; no persistent USB rules were installed. Fan3 measured around 870 RPM while running, and normal fan-stop/restart transitions occurred during the experiment. These transitions and the resulting temperature changes limit comparisons between phases. CPU utilization averaged approximately 0.4% across all logical CPUs, and advertised C3 residency was approximately 99%. The measurement session itself contributed background activity.
 
 These are short observations, not controlled benchmarks. Package energy counters do not measure total wall consumption; use an external meter to assess whole-system or peripheral savings. AMDGPU's `power1_average` on this APU includes CPU power and must not be added to the package reading as a separate GPU measurement.
+
+To repeat a measurement on this machine with `turbostat` installed, turn the display off, let background work settle, and collect a two-minute sample:
+
+```sh
+sleep 20
+sudo turbostat --quiet --Summary --interval 10 --num_iterations 12 \
+    --show 'Busy%,C3%,CorWatt,PkgWatt'
+```
+
+Record the power profile, device settings, temperatures, and fan state for each sample. Compare the original settings, one change, and the original settings again; use matching fan states and similar temperatures when judging small differences. Restore each experimental setting afterward. The daemon's normal two-second protection interval can remain in place during measurement.
 
 ## Contributing
 
