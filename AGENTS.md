@@ -27,7 +27,7 @@ Tests use Rust's built-in `#[test]` framework in `src/main.rs`; no coverage thre
 
 ## Commit & Pull Request Guidelines
 
-No commit history is established yet. Use concise imperative subjects, such as `Fix fan restart hysteresis`. Describe the problem, behavior changes, validation performed, and relevant issues in pull requests. For hardware changes, include hardware, configuration, and temperature/RPM observations.
+Existing commits use concise imperative subjects, such as `Add read-only sensor status and JSON output`. Follow that style. Describe the problem, behavior changes, validation performed, and relevant issues in pull requests. For hardware changes, include hardware, configuration, and temperature/RPM observations.
 
 ## Hardware Safety & Configuration
 

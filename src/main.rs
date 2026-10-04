@@ -3,6 +3,7 @@
 
 //! Controls paired fans with temperature validation and firmware restoration.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::ffi::c_int;
@@ -391,17 +392,31 @@ impl Hardware {
     }
 }
 
-fn parse_cpu_counters(text: &str) -> Result<Vec<(u64, u64)>, Box<dyn Error>> {
-    let mut result = Vec::new();
+/// Stores cumulative total and idle ticks by logical CPU identity.
+type CpuCounters = BTreeMap<u32, (u64, u64)>;
+
+fn parse_cpu_counters(text: &str) -> Result<CpuCounters, Box<dyn Error>> {
+    let mut result = BTreeMap::new();
     for line in text.lines() {
         let mut fields = line.split_whitespace();
         let name = fields.next().unwrap_or("");
-        if name.starts_with("cpu") && name != "cpu" {
-            let values: Vec<u64> = fields.take(8).map(str::parse).collect::<Result<_, _>>()?;
-            if values.len() != 8 {
-                return Err(err("incomplete CPU activity counters"));
-            }
-            result.push((values.iter().sum(), values[3] + values[4]));
+        let Some(cpu) = name.strip_prefix("cpu").filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let cpu = cpu.parse::<u32>()?;
+        let values: Vec<u64> = fields.take(8).map(str::parse).collect::<Result<_, _>>()?;
+        if values.len() != 8 {
+            return Err(err("incomplete CPU activity counters"));
+        }
+        let total = values
+            .iter()
+            .try_fold(0_u64, |sum, value| sum.checked_add(*value))
+            .ok_or_else(|| err("CPU activity counters overflow"))?;
+        let idle = values[3]
+            .checked_add(values[4])
+            .ok_or_else(|| err("CPU idle counters overflow"))?;
+        if result.insert(cpu, (total, idle)).is_some() {
+            return Err(err("duplicate CPU activity counters"));
         }
     }
     if result.is_empty() {
@@ -410,26 +425,33 @@ fn parse_cpu_counters(text: &str) -> Result<Vec<(u64, u64)>, Box<dyn Error>> {
     Ok(result)
 }
 
+/// Returns no utilization when hotplug or reset counters require a new baseline.
+///
+/// Callers must treat an unavailable interval as active and reset idle tracking.
 fn busiest_core_percent(
-    previous: &[(u64, u64)],
-    current: &[(u64, u64)],
-) -> Result<f64, Box<dyn Error>> {
-    if previous.len() != current.len() {
-        return Err(err("CPU topology changed"));
+    previous: &CpuCounters,
+    current: &CpuCounters,
+) -> Result<Option<f64>, Box<dyn Error>> {
+    if current.is_empty() {
+        return Err(err("no CPU activity counters"));
+    }
+    if previous.keys().ne(current.keys()) {
+        return Ok(None);
     }
     let mut busiest: f64 = 0.0;
-    for ((old_total, old_idle), (total, idle)) in previous.iter().zip(current) {
-        let elapsed = total
-            .checked_sub(*old_total)
-            .filter(|n| *n > 0)
-            .ok_or_else(|| err("invalid CPU counter interval"))?;
-        let idle_time = idle
-            .checked_sub(*old_idle)
-            .filter(|n| *n <= elapsed)
-            .ok_or_else(|| err("invalid CPU idle interval"))?;
+    for ((_, (old_total, old_idle)), (_, (total, idle))) in previous.iter().zip(current) {
+        let Some(elapsed) = total.checked_sub(*old_total).filter(|n| *n > 0) else {
+            return Ok(None);
+        };
+        let Some(idle_time) = idle.checked_sub(*old_idle) else {
+            return Ok(None);
+        };
+        if idle_time > elapsed {
+            return Err(err("invalid CPU idle interval"));
+        }
         busiest = busiest.max(100.0 * (elapsed - idle_time) as f64 / elapsed as f64);
     }
-    Ok(busiest)
+    Ok(Some(busiest))
 }
 
 fn should_stop_fans(
@@ -490,7 +512,11 @@ fn run(config: &Config, hardware: &Hardware) -> Result<(), Box<dyn Error>> {
         let mut want_off = false;
         if let Some(stop) = config.fan_stop_below {
             let current = parse_cpu_counters(&fs::read_to_string("/proc/stat")?)?;
-            let cpu_idle = busiest_core_percent(&cpu_previous, &current)? <= 10.0;
+            let busiest = busiest_core_percent(&cpu_previous, &current)?;
+            let cpu_idle = busiest.is_some_and(|percent| percent <= 10.0);
+            if busiest.is_none() {
+                println!("CPU activity baseline changed; resetting fan-stop idle timer");
+            }
             cpu_previous = current;
             let gpu_idle = hardware.gpu_idle()?;
             let cooling = hardware.cooling_temperature()?;
@@ -941,17 +967,57 @@ mod tests {
 
     #[test]
     fn one_busy_core_wakes_fans_even_on_a_32_thread_cpu() {
-        let previous = vec![(100, 100); 32];
-        let mut current = vec![(200, 200); 32];
-        current[7] = (200, 100);
-        assert_eq!(busiest_core_percent(&previous, &current).unwrap(), 100.0);
-        assert!(busiest_core_percent(&previous, &previous).is_err());
+        let previous: CpuCounters = (0..32).map(|cpu| (cpu, (100, 100))).collect();
+        let mut current: CpuCounters = (0..32).map(|cpu| (cpu, (200, 200))).collect();
+        current.insert(7, (200, 100));
+        assert_eq!(
+            busiest_core_percent(&previous, &current).unwrap(),
+            Some(100.0)
+        );
+        assert_eq!(busiest_core_percent(&previous, &previous).unwrap(), None);
     }
 
     #[test]
     fn ignores_duplicate_guest_cpu_time() {
         let text = "cpu 0 0 0 0 0 0 0 0 0 0\ncpu0 10 1 2 80 5 1 1 0 9 1\n";
-        assert_eq!(parse_cpu_counters(text).unwrap(), vec![(100, 85)]);
+        assert_eq!(
+            parse_cpu_counters(text).unwrap(),
+            BTreeMap::from([(0, (100, 85))])
+        );
+    }
+
+    #[test]
+    fn cpu_hotplug_requires_a_new_baseline_then_resumes_utilization_tracking() {
+        let before = BTreeMap::from([(0, (100, 80)), (1, (100, 80))]);
+        let offline = BTreeMap::from([(0, (200, 180))]);
+        assert_eq!(busiest_core_percent(&before, &offline).unwrap(), None);
+        let stable = BTreeMap::from([(0, (300, 280))]);
+        assert_eq!(busiest_core_percent(&offline, &stable).unwrap(), Some(0.0));
+        let online = BTreeMap::from([(0, (400, 380)), (1, (10, 5))]);
+        assert_eq!(busiest_core_percent(&stable, &online).unwrap(), None);
+        let active = BTreeMap::from([(0, (500, 480)), (1, (110, 5))]);
+        assert_eq!(busiest_core_percent(&online, &active).unwrap(), Some(100.0));
+    }
+
+    #[test]
+    fn cpu_identity_changes_are_detected_even_with_the_same_cpu_count() {
+        let previous = BTreeMap::from([(0, (100, 80)), (1, (100, 80))]);
+        let current = BTreeMap::from([(0, (200, 180)), (2, (200, 180))]);
+        assert_eq!(busiest_core_percent(&previous, &current).unwrap(), None);
+        let reordered =
+            parse_cpu_counters("cpu1 10 0 0 90 0 0 0 0\ncpu0 0 0 0 100 0 0 0 0\n").unwrap();
+        assert_eq!(reordered.keys().copied().collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn reset_cpu_counters_are_not_mistaken_for_idle() {
+        let previous = BTreeMap::from([(0, (100, 80))]);
+        let reset = BTreeMap::from([(0, (10, 5))]);
+        assert_eq!(busiest_core_percent(&previous, &reset).unwrap(), None);
+        let invalid = BTreeMap::from([(0, (110, 100))]);
+        assert!(busiest_core_percent(&previous, &invalid).is_err());
+        assert!(parse_cpu_counters("cpu0 1 2\n").is_err());
+        assert!(parse_cpu_counters("cpu0 0 0 0 1 0 0 0 0\ncpu0 0 0 0 1 0 0 0 0\n").is_err());
     }
 
     #[test]

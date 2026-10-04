@@ -134,6 +134,8 @@ gtr9-fan-control validate /etc/gtr9-fan-control.conf
 sudo systemctl restart gtr9-fan-control
 ```
 
+CPU hotplug is supported: changes in logical CPU identities or reset activity counters establish a new baseline and reset the fan-stop idle timer. Fans restart if they were stopped, and stopping requires a fresh idle cooldown. The controller does not offline CPUs itself.
+
 Configuration is loaded at startup. Validation checks syntax and configuration constraints; it does not verify hardware compatibility or calibrate fan duty.
 
 ## Troubleshooting
@@ -155,6 +157,14 @@ sudo ./uninstall.sh
 ```
 
 This stops and disables the service, attempts firmware restoration, and removes the installed binary and service unit. It retains `/etc/gtr9-fan-control.conf`.
+
+## Power-saving experiments
+
+Short idle tests on the original machine on 2026-10-04 measured approximately 4.4–4.6 W package power. Progressively offlining cores down to two physical cores saved only about 0.2–0.3 W, with inconsistent results across repeats. Automatic core offlining is not implemented.
+
+Changing ASPM policies and permitting runtime suspend for unused Ethernet/SD devices produced no clear package-power improvement. The tested PCIe links retained ASPM disabled, and those devices remained active. Experimental settings were restored afterward.
+
+These are short observations, not controlled benchmarks. Package energy counters do not measure total wall consumption; use an external meter to assess whole-system or peripheral savings. AMDGPU's `power1_average` on this APU includes CPU power and must not be added to the package reading as a separate GPU measurement.
 
 ## Contributing
 
