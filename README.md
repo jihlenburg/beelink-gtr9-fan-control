@@ -14,7 +14,8 @@ The daemon follows a temperature-based step curve, delays speed reductions, and 
 - Normal exit and signals restore firmware automatic mode and this machine's original start PWM of 60 on both channels.
 - Normal startup and waking from fan-stop use a one-second pulse at at least 35%, then follow the curve.
 - systemd independently runs `restore` after every service exit.
-- Configuration rejects decreasing duties and non-increasing temperatures. The final point must cover the critical temperature and use 100% duty; critical temperatures independently override the curve.
+- `restore` discovers only the ITE controller and attempts all restoration writes, even if CPU/GPU sensors, the tachometer, or manual-duty attributes are unavailable.
+- Configuration rejects zero or decreasing curve duties and non-increasing temperatures. Stopping fans requires the explicit fan-stop settings. The final point must cover the critical temperature and use 100% duty; critical temperatures independently override the curve.
 
 This is experimental software for undocumented consumer hardware, not a certified functional-safety system. The unavailable tach signal for the `pwm2` fan cannot be monitored.
 
@@ -72,16 +73,16 @@ Example JSON output (readings vary):
 ```json
 {
   "schema_version": 1,
-  "fans": { "fan2_rpm": null, "fan3_rpm": 698 },
+  "fans": { "fan2_rpm": null, "fan3_rpm": 870 },
   "temperatures_c": {
     "cpu": 38.5,
     "control": 39,
     "motherboard": { "temp1": 38, "temp2": 46, "temp3": 46 }
   },
   "raw": {
-    "pwm2": 31,
+    "pwm2": 38,
     "pwm2_enable": 1,
-    "pwm3": 31,
+    "pwm3": 38,
     "pwm3_enable": 1,
     "fan2_input": 0
   }
@@ -105,9 +106,11 @@ sudo gtr9-fan-control restore
 
 The service does not automatically restart after failures. Inspect the logs and resolve the cause before starting it again.
 
+The journal records duty changes, fan-stop/restart transitions, and stall recovery immediately. While duty remains steady, it reports temperature and RPM once per minute. Sensor polling, temperature protection, and stall detection still run at `poll_seconds`; each iteration shares one CPU/GPU temperature sample between curve selection and the fan-stop checks.
+
 ## Configuration
 
-The bundled configuration uses a 12% running-duty floor calibrated on the original test machine:
+The bundled configuration uses a 15% running-duty floor:
 
 ```ini
 poll_seconds=2
@@ -115,17 +118,17 @@ fall_delay_seconds=30
 hysteresis_c=4
 critical_temp_c=85
 fan_stall_seconds=10
-curve=0:12,50:25,60:35,70:55,78:75,85:100
+curve=0:15,50:25,60:35,70:55,78:75,85:100
 fan_stop_below_c=45
 fan_resume_at_c=50
 fan_stop_idle_seconds=30
 ```
 
-On this machine, 8%, 10%, and 12% all produced approximately 690 RPM on fan3; 5% stopped it. The 12% floor retains margin without increasing measured speed. Only fan3 provides a usable tachometer signal. The 60 PWM automatic start value is specific to the original settings captured on this machine.
+On this machine, 8%, 10%, and 12% all produced approximately 690 RPM on fan3; 5% stopped it. The running floor is now set to 15% for additional margin, measuring approximately 870 RPM on fan3 at 39C CPU temperature in a short check on 2026-10-04. Only fan3 provides a usable tachometer signal. The 60 PWM automatic start value is specific to the original settings captured on this machine.
 
 Fan-stop requires 30 seconds with every logical CPU at most 10% busy, GPU utilization at most 5%, and CPU/GPU, motherboard and SSD temperatures at or below 45C. Activity or any of these temperatures reaching 50C restarts the fans. Restart uses a one-second pulse at at least 35% duty. Omit `fan_stop_below_c` to disable fan-stop.
 
-Each curve point is `temperature_C:duty_percent`. The curve selects the last point whose temperature is at or below the current reading; values are not interpolated. Duty increases on the next polling iteration and decreases only after the configured delay and hysteresis margin.
+Each curve point is `temperature_C:duty_percent`, with duty in `1..100`. Use the fan-stop settings for intentional zero duty. The curve selects the last point whose temperature is at or below the current reading; values are not interpolated. Duty increases on the next polling iteration and decreases only after the configured delay and hysteresis margin.
 
 Edit `/etc/gtr9-fan-control.conf`, validate it, and restart to apply changes:
 
@@ -144,6 +147,7 @@ Configuration is loaded at startup. Validation checks syntax and configuration c
 | --- | --- |
 | `it8613 hwmon device not found` | Confirm the `it87` driver is loaded and exposes an `it8613` device. |
 | Missing CPU/GPU sensors | Both `k10temp` and `amdgpu` must be available. |
+| `k10temp` or `amdgpu` has no temperature inputs | The driver is present but exposes no temperature channels; resolve this before starting control. `restore` remains available. |
 | Missing ITE attribute | Verify the hardware and driver expose the expected PWM channels and fan3 tachometer. |
 | Temperature or activity read failure | Inspect the logged error and sensor availability; auxiliary sensors and GPU activity are used by fan-stop mode. |
 | Fan3 remains stopped after recovery | Restore firmware control and check the fan and calibrated running duty before restarting. |
@@ -163,6 +167,18 @@ This stops and disables the service, attempts firmware restoration, and removes 
 Short idle tests on the original machine on 2026-10-04 measured approximately 4.4–4.6 W package power. Progressively offlining cores down to two physical cores saved only about 0.2–0.3 W, with inconsistent results across repeats. Automatic core offlining is not implemented.
 
 Changing ASPM policies and permitting runtime suspend for unused Ethernet/SD devices produced no clear package-power improvement. The tested PCIe links retained ASPM disabled, and those devices remained active. Experimental settings were restored afterward.
+
+Further display-off tests on 2026-10-04 used the updated daemon and 15% running floor. Each phase settled for 20 seconds, then collected twelve ten-second `turbostat` samples. The sequence was:
+
+| Setting | Mean package power | Fan state |
+| --- | --- | --- |
+| Original `balanced` profile and USB settings | 4.59 W | Running |
+| `power-saver` profile (EPP `power`) | 4.38 W | Running, then stopped |
+| Original settings restored | 4.40 W | Running |
+| Autosuspend permitted for two USB receivers and the POROSVOC device | 4.56 W | Stopped |
+| Original settings restored again | 4.42 W | Stopped |
+
+The power-saver result was close to the later baseline readings, so these tests did not establish a repeatable saving. USB autosuspend suspended one receiver, while the other receiver, POROSVOC device, and both affected USB controllers remained active. Both experiments restored the original power profile and USB settings; no persistent USB rules were installed. Fan3 measured around 870 RPM while running, and normal fan-stop/restart transitions occurred during the experiment. These transitions and the resulting temperature changes limit comparisons between phases. CPU utilization averaged approximately 0.4% across all logical CPUs, and advertised C3 residency was approximately 99%. The measurement session itself contributed background activity.
 
 These are short observations, not controlled benchmarks. Package energy counters do not measure total wall consumption; use an external meter to assess whole-system or peripheral savings. AMDGPU's `power1_average` on this APU includes CPU power and must not be added to the package reading as a separate GPU measurement.
 

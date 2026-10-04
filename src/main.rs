@@ -33,6 +33,7 @@ const HWMON_ROOT: &str = "/sys/class/hwmon";
 const PWM_AUTOMATIC: u8 = 2;
 const PWM_MANUAL: u8 = 1;
 const PWM_FULL: u8 = 255;
+const STATUS_INTERVAL: Duration = Duration::from_secs(60);
 static STOP: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
@@ -186,6 +187,11 @@ impl Config {
                 return Err(err("curve duties must not decrease"));
             }
         }
+        if self.curve[0].duty.0 == 0 {
+            return Err(err(
+                "curve duties must be positive; use fan_stop_below_c to stop fans",
+            ));
+        }
         if let Some(stop) = self.fan_stop_below {
             if !(15..=45).contains(&stop.0)
                 || self.fan_resume_at <= stop
@@ -199,9 +205,6 @@ impl Config {
                 || self.idle_delay > Duration::from_secs(300)
             {
                 return Err(err("fan_stop_idle_seconds must be 10..300"));
-            }
-            if self.curve[0].duty.0 == 0 {
-                return Err(err("fan-stop mode requires a positive running duty"));
             }
         }
         Ok(())
@@ -244,23 +247,38 @@ fn parse_curve(value: &str) -> Result<Vec<CurvePoint>, Box<dyn Error>> {
 
 #[derive(Debug)]
 struct Hardware {
+    hwmon_root: PathBuf,
     ite: PathBuf,
     temp_inputs: Vec<PathBuf>,
 }
 
 impl Hardware {
+    /// Finds the controller without requiring sensors or prechecking write paths.
+    ///
+    /// Recovery must attempt every restoration write even when an attribute or
+    /// an unrelated sensor has disappeared.
+    fn discover_controller(root: &Path) -> Result<Self, Box<dyn Error>> {
+        for entry in fs::read_dir(root)? {
+            let path = entry?.path();
+            if read_trimmed(path.join("name")).unwrap_or_default() == "it8613" {
+                return Ok(Self {
+                    hwmon_root: root.to_owned(),
+                    ite: path,
+                    temp_inputs: Vec::new(),
+                });
+            }
+        }
+        Err(err("it8613 hwmon device not found; is it87 loaded?"))
+    }
+
     fn discover(root: &Path) -> Result<Self, Box<dyn Error>> {
-        let mut ite = None;
-        let mut temp_inputs = Vec::new();
+        let mut hardware = Self::discover_controller(root)?;
         let mut sensor_names = std::collections::BTreeSet::new();
         for entry in fs::read_dir(root)? {
             let path = entry?.path();
             let name = read_trimmed(path.join("name")).unwrap_or_default();
-            if name == "it8613" {
-                ite = Some(path.clone());
-            }
             if name == "k10temp" || name == "amdgpu" {
-                sensor_names.insert(name.clone());
+                let mut inputs = Vec::new();
                 for sensor in fs::read_dir(&path)? {
                     let sensor_path = sensor?.path();
                     let file = sensor_path
@@ -268,15 +286,16 @@ impl Hardware {
                         .and_then(|s| s.to_str())
                         .unwrap_or("");
                     if file.starts_with("temp") && file.ends_with("_input") {
-                        temp_inputs.push(sensor_path);
+                        inputs.push(sensor_path);
                     }
                 }
+                if inputs.is_empty() {
+                    return Err(err(format!("{name} has no temperature inputs")));
+                }
+                sensor_names.insert(name);
+                hardware.temp_inputs.extend(inputs);
             }
         }
-        let hardware = Self {
-            ite: ite.ok_or_else(|| err("it8613 hwmon device not found; is it87 loaded?"))?,
-            temp_inputs,
-        };
         if sensor_names.len() != 2 {
             return Err(err(
                 "both k10temp and amdgpu temperature sensors are required",
@@ -301,13 +320,7 @@ impl Hardware {
     fn temperature(&self) -> Result<TempC, Box<dyn Error>> {
         let mut values = Vec::new();
         for path in &self.temp_inputs {
-            let raw = read_trimmed(path)?.parse::<i32>()?;
-            if !(-20_000..=130_000).contains(&raw) {
-                return Err(err(format!(
-                    "invalid temperature in {}: {raw}",
-                    path.display()
-                )));
-            }
+            let raw = read_temperature(path)?;
             values.push((raw + 999).div_euclid(1000));
         }
         values
@@ -317,11 +330,12 @@ impl Hardware {
             .ok_or_else(|| err("all temperature readings are invalid"))
     }
 
-    fn cooling_temperature(&self) -> Result<TempC, Box<dyn Error>> {
-        let mut hottest = self.temperature()?;
+    /// Adds auxiliary readings to this polling iteration's CPU/GPU sample.
+    fn cooling_temperature(&self, control: TempC) -> Result<TempC, Box<dyn Error>> {
+        let mut hottest = control;
         // Also protect motherboard and SSD temperatures while airflow is stopped.
         let mut dirs = vec![self.ite.clone()];
-        for entry in fs::read_dir(HWMON_ROOT)? {
+        for entry in fs::read_dir(&self.hwmon_root)? {
             let dir = entry?.path();
             if read_trimmed(dir.join("name"))? == "nvme" {
                 dirs.push(dir);
@@ -332,10 +346,7 @@ impl Hardware {
                 let path = entry?.path();
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                 if name.starts_with("temp") && name.ends_with("_input") {
-                    let raw: i32 = read_trimmed(&path)?.parse()?;
-                    if !(-20_000..=130_000).contains(&raw) {
-                        return Err(err("invalid auxiliary temperature"));
-                    }
+                    let raw = read_temperature(&path)?;
                     hottest = hottest.max(TempC((raw + 999).div_euclid(1000)));
                 }
             }
@@ -478,6 +489,27 @@ impl Drop for AutomaticGuard<'_> {
     }
 }
 
+/// Logs duty changes immediately and otherwise summarizes once per minute.
+struct StatusLog {
+    duty: Duty,
+    last_report: Instant,
+}
+
+impl StatusLog {
+    fn report(&mut self, temp: TempC, duty: Duty, rpm: u32) {
+        if duty != self.duty || self.last_report.elapsed() >= STATUS_INTERVAL {
+            println!(
+                "temperature={}C duty={}% fan3={}rpm",
+                temp.0,
+                duty.percent(),
+                rpm
+            );
+            self.duty = duty;
+            self.last_report = Instant::now();
+        }
+    }
+}
+
 fn run(config: &Config, hardware: &Hardware) -> Result<(), Box<dyn Error>> {
     let initial_temp = hardware.temperature()?;
     hardware.set_manual()?;
@@ -493,6 +525,10 @@ fn run(config: &Config, hardware: &Hardware) -> Result<(), Box<dyn Error>> {
     let mut stalled_since: Option<Instant> = None;
     let mut idle_since: Option<Instant> = None;
     let mut cpu_previous = parse_cpu_counters(&fs::read_to_string("/proc/stat")?)?;
+    let mut status_log = StatusLog {
+        duty,
+        last_report: Instant::now(),
+    };
     println!(
         "started: temperature={}C duty={}%; pwm2=pwm3",
         initial_temp.0,
@@ -519,7 +555,7 @@ fn run(config: &Config, hardware: &Hardware) -> Result<(), Box<dyn Error>> {
             }
             cpu_previous = current;
             let gpu_idle = hardware.gpu_idle()?;
-            let cooling = hardware.cooling_temperature()?;
+            let cooling = hardware.cooling_temperature(temp)?;
             if cpu_idle && gpu_idle && cooling <= stop {
                 idle_since.get_or_insert_with(Instant::now);
             } else {
@@ -543,11 +579,7 @@ fn run(config: &Config, hardware: &Hardware) -> Result<(), Box<dyn Error>> {
             }
             lower_since = None;
             stalled_since = None;
-            println!(
-                "temperature={}C duty=0% fan3={}rpm",
-                temp.0,
-                hardware.fan_rpm()?
-            );
+            status_log.report(temp, duty, hardware.fan_rpm()?);
             continue;
         }
         if duty.0 == 0 {
@@ -586,6 +618,7 @@ fn run(config: &Config, hardware: &Hardware) -> Result<(), Box<dyn Error>> {
         if duty.0 > 0 && rpm == 0 {
             let since = stalled_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= config.fan_stall {
+                println!("fan3 stalled; attempting 100% recovery pulse");
                 hardware.set_duty(Duty(PWM_FULL))?;
                 thread::sleep(Duration::from_secs(3));
                 if hardware.fan_rpm()? == 0 {
@@ -593,17 +626,13 @@ fn run(config: &Config, hardware: &Hardware) -> Result<(), Box<dyn Error>> {
                 }
                 duty = Duty(PWM_FULL);
                 stalled_since = None;
+                println!("fan3 recovered; holding 100% until the curve permits a reduction");
             }
         } else {
             stalled_since = None;
         }
 
-        println!(
-            "temperature={}C duty={}% fan3={}rpm",
-            temp.0,
-            duty.percent(),
-            rpm
-        );
+        status_log.report(temp, duty, rpm);
     }
     println!("stopping; restoring firmware automatic control");
     Ok(())
@@ -780,7 +809,7 @@ fn real_main() -> Result<(), Box<dyn Error>> {
             run(&config, &hw)
         }
         "restore" => {
-            Hardware::discover(Path::new(HWMON_ROOT))?.restore_automatic()?;
+            Hardware::discover_controller(Path::new(HWMON_ROOT))?.restore_automatic()?;
             println!("pwm2 and pwm3 restored to automatic mode");
             Ok(())
         }
@@ -817,6 +846,129 @@ mod tests {
     use super::*;
 
     const GOOD: &str = "poll_seconds=2\nfall_delay_seconds=30\nhysteresis_c=4\ncritical_temp_c=90\nfan_stall_seconds=10\ncurve=0:25,60:30,70:40,80:55,90:100\n";
+
+    /// Provides an isolated hwmon tree and removes it even when a test fails.
+    struct HwmonFixture(PathBuf);
+
+    impl HwmonFixture {
+        fn new(name: &str) -> Self {
+            let root = env::temp_dir().join(format!("gtr9-{name}-{}", std::process::id()));
+            fs::create_dir(&root).unwrap();
+            let fixture = Self(root);
+            for (directory, chip) in [("ite", "it8613"), ("cpu", "k10temp"), ("gpu", "amdgpu")] {
+                let path = fixture.0.join(directory);
+                fs::create_dir(&path).unwrap();
+                fs::write(path.join("name"), chip).unwrap();
+                fs::write(path.join("temp1_input"), "35000").unwrap();
+            }
+            for attribute in [
+                "pwm2",
+                "pwm3",
+                "pwm2_enable",
+                "pwm3_enable",
+                "pwm2_auto_start",
+                "pwm3_auto_start",
+                "fan3_input",
+            ] {
+                fs::write(fixture.0.join("ite").join(attribute), "0").unwrap();
+            }
+            fixture
+        }
+    }
+
+    impl Drop for HwmonFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn restoration_does_not_require_temperature_tachometer_or_manual_duty_attributes() {
+        let fixture = HwmonFixture::new("restore-discovery-test");
+        fs::remove_dir_all(fixture.0.join("cpu")).unwrap();
+        fs::remove_dir_all(fixture.0.join("gpu")).unwrap();
+        for attribute in ["fan3_input", "pwm2", "pwm3"] {
+            fs::remove_file(fixture.0.join("ite").join(attribute)).unwrap();
+        }
+        assert!(Hardware::discover(&fixture.0).is_err());
+        let hardware = Hardware::discover_controller(&fixture.0).unwrap();
+        hardware.restore_automatic().unwrap();
+        for channel in [2, 3] {
+            assert_eq!(
+                read_trimmed(hardware.ite.join(format!("pwm{channel}_auto_start"))).unwrap(),
+                "60"
+            );
+            assert_eq!(
+                read_trimmed(hardware.ite.join(format!("pwm{channel}_enable"))).unwrap(),
+                "2"
+            );
+        }
+    }
+
+    #[test]
+    fn restoration_attempts_remaining_writes_after_an_attribute_failure() {
+        let fixture = HwmonFixture::new("restore-partial-test");
+        let broken = fixture.0.join("ite/pwm2_auto_start");
+        fs::remove_file(&broken).unwrap();
+        fs::create_dir(&broken).unwrap();
+        let hardware = Hardware::discover_controller(&fixture.0).unwrap();
+        assert!(hardware.restore_automatic().is_err());
+        for (attribute, expected) in [
+            ("pwm3_auto_start", "60"),
+            ("pwm2_enable", "2"),
+            ("pwm3_enable", "2"),
+        ] {
+            assert_eq!(
+                read_trimmed(hardware.ite.join(attribute)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_requires_temperature_inputs_from_each_chip() {
+        let fixture = HwmonFixture::new("sensor-discovery-test");
+        assert_eq!(Hardware::discover(&fixture.0).unwrap().temp_inputs.len(), 2);
+        for (directory, chip) in [("cpu", "k10temp"), ("gpu", "amdgpu")] {
+            let input = fixture.0.join(directory).join("temp1_input");
+            fs::remove_file(&input).unwrap();
+            let error = Hardware::discover(&fixture.0).unwrap_err().to_string();
+            assert_eq!(error, format!("{chip} has no temperature inputs"));
+            fs::write(input, "35000").unwrap();
+        }
+    }
+
+    #[test]
+    fn cooling_reuses_control_sample_and_tracks_new_auxiliary_sensors() {
+        let fixture = HwmonFixture::new("cooling-sample-test");
+        let hardware = Hardware::discover(&fixture.0).unwrap();
+        fs::write(fixture.0.join("cpu/temp1_input"), "50001").unwrap();
+        let control = hardware.temperature().unwrap();
+        // Auxiliary sampling must not reread CPU/GPU files in the same iteration.
+        fs::remove_file(fixture.0.join("cpu/temp1_input")).unwrap();
+        assert_eq!(hardware.cooling_temperature(control).unwrap(), TempC(51));
+        fs::write(hardware.ite.join("temp1_input"), "56000").unwrap();
+        assert_eq!(hardware.cooling_temperature(control).unwrap(), TempC(56));
+        let nvme = fixture.0.join("ssd");
+        fs::create_dir(&nvme).unwrap();
+        fs::write(nvme.join("name"), "nvme").unwrap();
+        fs::write(nvme.join("temp1_input"), "60000").unwrap();
+        assert_eq!(hardware.cooling_temperature(control).unwrap(), TempC(60));
+        fs::write(nvme.join("temp1_input"), "invalid").unwrap();
+        assert!(hardware.cooling_temperature(control).is_err());
+        fs::write(nvme.join("temp1_input"), "131000").unwrap();
+        assert!(hardware.cooling_temperature(control).is_err());
+        assert!(hardware.temperature().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_running_duty_with_or_without_fan_stop() {
+        for settings in ["", "fan_stop_below_c=40\nfan_resume_at_c=45\n"] {
+            let zero = format!("{}{settings}", GOOD.replace("0:25", "0:0"));
+            assert!(Config::parse(&zero).is_err());
+            assert!(Config::parse(&zero.replace("0:0", "0:1")).is_ok());
+        }
+    }
 
     #[test]
     fn parses_and_selects_step_curve() {
@@ -871,6 +1023,7 @@ mod tests {
         fs::write(&cpu, "30001").unwrap();
         fs::write(&gpu, "30000").unwrap();
         let hw = Hardware {
+            hwmon_root: dir.clone(),
             ite: dir.clone(),
             temp_inputs: vec![cpu, gpu.clone()],
         };
@@ -911,6 +1064,7 @@ mod tests {
             fs::write(ite.join(name), value).unwrap();
         }
         let hardware = Hardware {
+            hwmon_root: dir.clone(),
             ite: ite.clone(),
             temp_inputs: vec![gpu.join("temp1_input"), cpu.join("temp1_input")],
         };
@@ -948,6 +1102,7 @@ mod tests {
         let dir = env::temp_dir().join(format!("gtr9-restore-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let hw = Hardware {
+            hwmon_root: dir.clone(),
             ite: dir.clone(),
             temp_inputs: vec![],
         };
