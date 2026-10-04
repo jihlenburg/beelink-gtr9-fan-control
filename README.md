@@ -49,6 +49,45 @@ journalctl -u gtr9-fan-control -f
 
 `status` and `validate` are read-only and run without `sudo` when the sensor files and configuration are readable. `run` and `restore` write hardware settings and require root. If `/usr/local/sbin` is absent from your shell's `PATH`, use `/usr/local/sbin/gtr9-fan-control`.
 
+Show fan RPM, CPU temperature, and each motherboard temperature channel without root:
+
+```sh
+gtr9-fan-control status
+watch -n 2 gtr9-fan-control status
+```
+
+The report includes the hottest CPU sensor reading and all ITE temperature channels, identified as `temp1`, `temp2`, etc., because their physical locations are undocumented. Fan3 provides usable RPM; fan2 is marked unavailable. Raw PWM and tachometer fields remain available in the output.
+
+For scripts and monitoring, request JSON:
+
+```sh
+gtr9-fan-control status --json
+gtr9-fan-control status --json | python3 -m json.tool
+```
+
+The output is one JSON object with `schema_version: 1`, `fans` (`fan2_rpm`, `fan3_rpm`), `temperatures_c` (`cpu`, `control`, and a `motherboard` channel map), and `raw` PWM values/modes plus `fan2_input`. RPM values are integers; temperatures are numeric degrees Celsius. Unavailable fan2 RPM is `null`; an absent motherboard sensor set is `{}`. `control` is the rounded-up hottest CPU/GPU reading used by the daemon. Errors go to stderr with a nonzero exit status and no partial JSON on stdout.
+
+Example JSON output (readings vary):
+
+```json
+{
+  "schema_version": 1,
+  "fans": { "fan2_rpm": null, "fan3_rpm": 698 },
+  "temperatures_c": {
+    "cpu": 38.5,
+    "control": 39,
+    "motherboard": { "temp1": 38, "temp2": 46, "temp3": 46 }
+  },
+  "raw": {
+    "pwm2": 31,
+    "pwm2_enable": 1,
+    "pwm3": 31,
+    "pwm3_enable": 1,
+    "fan2_input": 0
+  }
+}
+```
+
 Inspect service status and recent logs:
 
 ```sh

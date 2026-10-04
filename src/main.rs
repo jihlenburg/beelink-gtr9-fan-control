@@ -591,19 +591,139 @@ fn write_value(path: impl AsRef<Path>, value: u8) -> Result<(), Box<dyn Error>> 
         .map_err(|e| err(format!("cannot write {}: {e}", path.as_ref().display())))
 }
 
-fn status(hardware: &Hardware) -> Result<(), Box<dyn Error>> {
-    for name in [
-        "pwm2",
-        "pwm2_enable",
-        "pwm3",
-        "pwm3_enable",
-        "fan2_input",
-        "fan3_input",
-    ] {
-        println!("{name}={}", read_trimmed(hardware.ite.join(name))?);
+/// Reads a validated hwmon temperature in millidegrees Celsius.
+fn read_temperature(path: &Path) -> Result<i32, Box<dyn Error>> {
+    let raw = read_trimmed(path)?.parse::<i32>()?;
+    if !(-20_000..=130_000).contains(&raw) {
+        return Err(err(format!(
+            "invalid temperature in {}: {raw}",
+            path.display()
+        )));
     }
-    println!("control_temperature_c={}", hardware.temperature()?.0);
+    Ok(raw)
+}
+
+/// Holds one read-only sample shared by the text and JSON formatters.
+struct StatusSnapshot {
+    pwm2: u8,
+    pwm2_enable: u8,
+    pwm3: u8,
+    pwm3_enable: u8,
+    fan2_input: u32,
+    fan3_rpm: u32,
+    control_temperature: TempC,
+    cpu_temperature_mc: i32,
+    motherboard_temperatures_mc: Vec<(u32, i32)>,
+}
+
+impl StatusSnapshot {
+    fn read(hardware: &Hardware) -> Result<Self, Box<dyn Error>> {
+        let mut cpu_temperature = None;
+        for input in &hardware.temp_inputs {
+            let dir = input.parent().ok_or_else(|| err("invalid sensor path"))?;
+            if read_trimmed(dir.join("name"))? == "k10temp" {
+                let value = read_temperature(input)?;
+                cpu_temperature =
+                    Some(cpu_temperature.map_or(value, |previous: i32| previous.max(value)));
+            }
+        }
+        let mut motherboard_temperatures_mc = Vec::new();
+        for entry in fs::read_dir(&hardware.ite)? {
+            let path = entry?.path();
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if let Some(sensor) = name
+                .strip_prefix("temp")
+                .and_then(|s| s.strip_suffix("_input"))
+            {
+                // Only numeric hwmon channel identifiers can become JSON keys.
+                if !sensor.is_empty() && sensor.bytes().all(|b| b.is_ascii_digit()) {
+                    motherboard_temperatures_mc.push((sensor.parse()?, read_temperature(&path)?));
+                }
+            }
+        }
+        motherboard_temperatures_mc.sort_by_key(|(channel, _)| *channel);
+        Ok(Self {
+            pwm2: read_trimmed(hardware.ite.join("pwm2"))?.parse()?,
+            pwm2_enable: read_trimmed(hardware.ite.join("pwm2_enable"))?.parse()?,
+            pwm3: read_trimmed(hardware.ite.join("pwm3"))?.parse()?,
+            pwm3_enable: read_trimmed(hardware.ite.join("pwm3_enable"))?.parse()?,
+            fan2_input: read_trimmed(hardware.ite.join("fan2_input"))?.parse()?,
+            fan3_rpm: hardware.fan_rpm()?,
+            control_temperature: hardware.temperature()?,
+            cpu_temperature_mc: cpu_temperature
+                .ok_or_else(|| err("CPU temperature unavailable"))?,
+            motherboard_temperatures_mc,
+        })
+    }
+
+    fn text(&self) -> String {
+        let mut report = format!(
+            "pwm2={}\npwm2_enable={}\npwm3={}\npwm3_enable={}\nfan2_input={}\nfan3_input={}\ncontrol_temperature_c={}\n\nFan 3: {} RPM\nFan 2: RPM unavailable (no usable tachometer)\nCPU: {:.1} °C\n",
+            self.pwm2,
+            self.pwm2_enable,
+            self.pwm3,
+            self.pwm3_enable,
+            self.fan2_input,
+            self.fan3_rpm,
+            self.control_temperature.0,
+            self.fan3_rpm,
+            f64::from(self.cpu_temperature_mc) / 1000.0,
+        );
+        if self.motherboard_temperatures_mc.is_empty() {
+            report.push_str("Motherboard: temperature unavailable\n");
+        }
+        for (channel, value) in &self.motherboard_temperatures_mc {
+            report.push_str(&format!(
+                "Motherboard (temp{channel}): {:.1} °C\n",
+                f64::from(*value) / 1000.0,
+            ));
+        }
+        report
+    }
+
+    /// Serializes numeric readings using fixed keys and validated channel numbers.
+    fn json(&self) -> String {
+        let motherboard = self
+            .motherboard_temperatures_mc
+            .iter()
+            .map(|(channel, value)| format!("\"temp{channel}\":{}", f64::from(*value) / 1000.0))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"schema_version\":1,\"fans\":{{\"fan2_rpm\":null,\"fan3_rpm\":{}}},\"temperatures_c\":{{\"cpu\":{},\"control\":{},\"motherboard\":{{{}}}}},\"raw\":{{\"pwm2\":{},\"pwm2_enable\":{},\"pwm3\":{},\"pwm3_enable\":{},\"fan2_input\":{}}}}}\n",
+            self.fan3_rpm,
+            f64::from(self.cpu_temperature_mc) / 1000.0,
+            self.control_temperature.0,
+            motherboard,
+            self.pwm2,
+            self.pwm2_enable,
+            self.pwm3,
+            self.pwm3_enable,
+            self.fan2_input,
+        )
+    }
+}
+
+fn status(hardware: &Hardware, json: bool) -> Result<(), Box<dyn Error>> {
+    let snapshot = StatusSnapshot::read(hardware)?;
+    print!(
+        "{}",
+        if json {
+            snapshot.json()
+        } else {
+            snapshot.text()
+        }
+    );
     Ok(())
+}
+
+/// Accepts only the documented status output option.
+fn status_json_option(args: &[String]) -> Result<bool, Box<dyn Error>> {
+    match args {
+        [] => Ok(false),
+        [option] if option == "--json" => Ok(true),
+        _ => Err(err("Usage: gtr9-fan-control status [--json]")),
+    }
 }
 
 unsafe extern "C" {
@@ -638,14 +758,19 @@ fn real_main() -> Result<(), Box<dyn Error>> {
             println!("pwm2 and pwm3 restored to automatic mode");
             Ok(())
         }
-        "status" => status(&Hardware::discover(Path::new(HWMON_ROOT))?),
+        "status" => {
+            let json = status_json_option(&args[2..])?;
+            status(&Hardware::discover(Path::new(HWMON_ROOT))?, json)
+        }
         "validate" => {
             Config::load(config_path)?;
             println!("{} is valid", config_path.display());
             Ok(())
         }
         _ => {
-            println!("Usage: gtr9-fan-control <run|status|restore|validate> [config]");
+            println!(
+                "Usage: gtr9-fan-control <run|restore|validate> [config]\n       gtr9-fan-control status [--json]"
+            );
             Ok(())
         }
     }
@@ -731,6 +856,65 @@ mod tests {
         fs::remove_file(&gpu).unwrap();
         assert!(hw.temperature().is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn status_reports_cpu_separately_from_gpu_and_does_not_write_hardware() {
+        let dir = env::temp_dir().join(format!("gtr9-status-test-{}", std::process::id()));
+        let cpu = dir.join("cpu");
+        let gpu = dir.join("gpu");
+        let ite = dir.join("ite");
+        for path in [&cpu, &gpu, &ite] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(cpu.join("name"), "k10temp").unwrap();
+        fs::write(cpu.join("temp1_input"), "38500").unwrap();
+        fs::write(gpu.join("name"), "amdgpu").unwrap();
+        fs::write(gpu.join("temp1_input"), "55000").unwrap();
+        let attributes = [
+            ("pwm2", "31"),
+            ("pwm3", "31"),
+            ("pwm2_enable", "1"),
+            ("pwm3_enable", "1"),
+            ("fan2_input", "0"),
+            ("fan3_input", "698"),
+            ("temp1_input", "38000"),
+            ("temp2_input", "46000"),
+        ];
+        for (name, value) in attributes {
+            fs::write(ite.join(name), value).unwrap();
+        }
+        let hardware = Hardware {
+            ite: ite.clone(),
+            temp_inputs: vec![gpu.join("temp1_input"), cpu.join("temp1_input")],
+        };
+        let snapshot = StatusSnapshot::read(&hardware).unwrap();
+        let report = snapshot.text();
+        let json = snapshot.json();
+        assert!(json.contains("\"fan2_rpm\":null"));
+        assert!(json.contains("\"fan3_rpm\":698"));
+        assert!(json.contains("\"cpu\":38.5"));
+        assert!(json.contains("\"control\":55"));
+        assert!(json.contains("\"motherboard\":{\"temp1\":38,\"temp2\":46}"));
+        assert!(report.contains("Fan 3: 698 RPM"));
+        assert!(report.contains("Fan 2: RPM unavailable"));
+        assert!(report.contains("CPU: 38.5 °C"));
+        assert!(report.contains("control_temperature_c=55"));
+        assert!(report.contains("Motherboard (temp2): 46.0 °C"));
+        for (name, value) in attributes {
+            assert_eq!(read_trimmed(ite.join(name)).unwrap(), value);
+        }
+        fs::write(ite.join("temp2_input"), "131000").unwrap();
+        assert!(StatusSnapshot::read(&hardware).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn status_options_reject_unknown_or_duplicate_flags() {
+        assert!(!status_json_option(&[]).unwrap());
+        assert!(status_json_option(&["--json".into()]).unwrap());
+        assert!(status_json_option(&["--jsno".into()]).is_err());
+        assert!(status_json_option(&["--json".into(), "--json".into()]).is_err());
     }
 
     #[test]
