@@ -5,9 +5,11 @@ ConditionPathExists=/sys/class/hwmon
 
 [Service]
 Type=simple
+ExecStartPre=/usr/local/sbin/gtr9-fan-control wait-ready
 ExecStart=/usr/local/sbin/gtr9-fan-control run /etc/gtr9-fan-control.conf
 ExecStopPost=/usr/local/sbin/gtr9-fan-control restore
 Restart=no
+TimeoutStartSec=35
 TimeoutStopSec=15
 User=root
 NoNewPrivileges=yes

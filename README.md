@@ -8,6 +8,7 @@ The daemon follows a temperature-based step curve, delays speed reductions, and 
 
 - `pwm2` and `pwm3` are always commanded to the same value.
 - CPU and GPU temperature inputs are validated; the hottest reading wins.
+- Before starting the daemon, systemd waits up to 30 seconds for the ITE controller and valid CPU/GPU temperature readings. This check does not write hardware settings, so automatic cooling remains in control during normal boot. If readiness times out, startup fails and systemd attempts firmware restoration.
 - Critical CPU/GPU temperatures select 100% duty when sampled; the polling interval determines detection latency.
 - A CPU/GPU temperature read failure in the main polling loop commands 100% before exiting. Startup, restart-pulse, and auxiliary sensor failures return an error and trigger firmware restoration after manual control has begun.
 - A zero fan3 RPM reading while duty is positive triggers a three-second 100% recovery pulse after the stall timeout. If the fan remains stopped, the daemon exits and restores firmware control. Intentional fan-stop is exempt.
@@ -64,7 +65,7 @@ The installer preserves `/etc/gtr9-fan-control.conf`, so an existing 12% floor n
 
 ## Operation and recovery
 
-`status` and `validate` are read-only and run without `sudo` when the sensor files and configuration are readable. `run` and `restore` write hardware settings and require root. If `/usr/local/sbin` is absent from your shell's `PATH`, use `/usr/local/sbin/gtr9-fan-control`.
+`status`, `validate`, and `wait-ready` are read-only and run without `sudo` when the sensor files and configuration are readable. `run` and `restore` write hardware settings and require root. If `/usr/local/sbin` is absent from your shell's `PATH`, use `/usr/local/sbin/gtr9-fan-control`.
 
 Show fan RPM, CPU temperature, and each motherboard temperature channel without root:
 
@@ -120,6 +121,8 @@ sudo systemctl stop gtr9-fan-control
 sudo gtr9-fan-control restore
 ```
 
+The service runs `wait-ready` before `run` to handle drivers that expose their sensors late during boot. It retries discovery and temperature reads every 250 milliseconds for up to 30 seconds; already-ready hardware proceeds immediately. systemd limits the startup phase to 35 seconds. Direct invocations of `run` still require hardware to be ready.
+
 The service does not automatically restart after failures. Inspect the logs and resolve the cause before starting it again.
 
 The journal records duty changes, fan-stop/restart transitions, and stall recovery immediately. While duty remains steady, it reports temperature and RPM once per minute. Sensor polling, temperature protection, and stall detection still run at `poll_seconds`; each iteration shares one CPU/GPU temperature sample between curve selection and the fan-stop checks.
@@ -164,7 +167,8 @@ Configuration is loaded at startup. Validation checks syntax and configuration c
 | Symptom | What to check |
 | --- | --- |
 | `it8613 hwmon device not found` | Confirm the `it87` driver is loaded and exposes an `it8613` device. |
-| Missing CPU/GPU sensors | Both `k10temp` and `amdgpu` must be available. |
+| Hardware readiness timed out | The controller and valid `k10temp`/`amdgpu` readings did not become available within 30 seconds. Check the final logged error and driver initialization. |
+| Missing CPU/GPU sensors | Both `k10temp` and `amdgpu` must be available; the service waits for them during startup. |
 | `k10temp` or `amdgpu` has no temperature inputs | The driver is present but exposes no temperature channels; resolve this before starting control. `restore` remains available. |
 | Missing ITE attribute | Verify the hardware and driver expose the expected PWM channels and fan3 tachometer. |
 | Temperature or activity read failure | Inspect the logged error and sensor availability; auxiliary sensors and GPU activity are used by fan-stop mode. |

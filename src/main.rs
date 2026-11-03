@@ -34,6 +34,8 @@ const PWM_AUTOMATIC: u8 = 2;
 const PWM_MANUAL: u8 = 1;
 const PWM_FULL: u8 = 255;
 const STATUS_INTERVAL: Duration = Duration::from_secs(60);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const STARTUP_POLL: Duration = Duration::from_millis(250);
 static STOP: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
@@ -400,6 +402,32 @@ impl Hardware {
         let first = write_value(self.ite.join("pwm2_enable"), PWM_AUTOMATIC);
         let second = write_value(self.ite.join("pwm3_enable"), PWM_AUTOMATIC);
         start2.and(start3).and(first).and(second)
+    }
+}
+
+/// Waits for controller discovery and valid CPU/GPU readings without hardware writes.
+fn wait_ready(root: &Path, timeout: Duration) -> Result<(), Box<dyn Error>> {
+    let started = Instant::now();
+    let mut waiting = false;
+    loop {
+        let error = match Hardware::discover(root).and_then(|hardware| hardware.temperature()) {
+            Ok(_) => {
+                println!("controller and CPU/GPU temperature sensors are ready");
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(err(format!(
+                "hardware readiness timed out after {timeout:?}: {error}"
+            )));
+        }
+        if !waiting {
+            println!("waiting up to {timeout:?} for controller and temperature sensors: {error}");
+            waiting = true;
+        }
+        thread::sleep(STARTUP_POLL.min(remaining));
     }
 }
 
@@ -802,6 +830,12 @@ fn real_main() -> Result<(), Box<dyn Error>> {
     let command = args.get(1).map(String::as_str).unwrap_or("help");
     let config_path = Path::new(args.get(2).map(String::as_str).unwrap_or(DEFAULT_CONFIG));
     match command {
+        "wait-ready" => {
+            if args.len() != 2 {
+                return Err(err("Usage: gtr9-fan-control wait-ready"));
+            }
+            wait_ready(Path::new(HWMON_ROOT), STARTUP_TIMEOUT)
+        }
         "run" => {
             let config = Config::load(config_path)?;
             let hw = Hardware::discover(Path::new(HWMON_ROOT))?;
@@ -824,7 +858,7 @@ fn real_main() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             println!(
-                "Usage: gtr9-fan-control <run|restore|validate> [config]\n       gtr9-fan-control status [--json]"
+                "Usage: gtr9-fan-control <run|restore|validate> [config]\n       gtr9-fan-control status [--json]\n       gtr9-fan-control wait-ready"
             );
             Ok(())
         }
@@ -874,11 +908,76 @@ mod tests {
             }
             fixture
         }
+
+        fn controller_snapshot(&self) -> BTreeMap<String, String> {
+            fs::read_dir(self.0.join("ite"))
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (
+                        path.file_name().unwrap().to_str().unwrap().to_owned(),
+                        fs::read_to_string(path).unwrap(),
+                    )
+                })
+                .collect()
+        }
     }
 
     impl Drop for HwmonFixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn readiness_succeeds_immediately_without_changing_controller() {
+        let fixture = HwmonFixture::new("ready-immediate-test");
+        let before = fixture.controller_snapshot();
+        wait_ready(&fixture.0, Duration::ZERO).unwrap();
+        assert_eq!(fixture.controller_snapshot(), before);
+    }
+
+    #[test]
+    fn readiness_waits_for_gpu_temperature_to_appear() {
+        let fixture = HwmonFixture::new("ready-delayed-test");
+        let input = fixture.0.join("gpu/temp1_input");
+        fs::remove_file(&input).unwrap();
+        let before = fixture.controller_snapshot();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(50));
+                fs::write(&input, "35000").unwrap();
+            });
+            wait_ready(&fixture.0, Duration::from_secs(5)).unwrap();
+        });
+        assert_eq!(fixture.controller_snapshot(), before);
+    }
+
+    #[test]
+    fn readiness_times_out_on_missing_or_invalid_sensors_without_writes() {
+        let fixture = HwmonFixture::new("ready-timeout-test");
+        let input = fixture.0.join("gpu/temp1_input");
+        let before = fixture.controller_snapshot();
+        for value in [None, Some("invalid"), Some("131000")] {
+            if let Some(value) = value {
+                fs::write(&input, value).unwrap();
+            } else {
+                fs::remove_file(&input).unwrap();
+            }
+            let error = wait_ready(&fixture.0, Duration::from_millis(10))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("hardware readiness timed out"), "{error}");
+            assert_eq!(fixture.controller_snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn readiness_requires_controller_and_both_sensor_devices() {
+        for directory in ["ite", "cpu", "gpu"] {
+            let fixture = HwmonFixture::new(&format!("ready-missing-{directory}-test"));
+            fs::remove_dir_all(fixture.0.join(directory)).unwrap();
+            assert!(wait_ready(&fixture.0, Duration::ZERO).is_err());
         }
     }
 
